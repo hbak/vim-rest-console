@@ -193,9 +193,11 @@ endfunction
 " @return dict {'header1': 'value1', 'header2': 'value2'}
 "
 function! s:ParseHeaders(start, end)
-  let contentTypeOpt = s:GetOpt('vrc_header_content_type', 'application/json')
-  let headers = {'Content-Type': contentTypeOpt}
+  let headers = {}
   if (a:end < a:start)
+    " Only set default Content-Type if no global headers exist
+    let contentTypeOpt = s:GetOpt('vrc_header_content_type', 'application/json')
+    let headers['Content-Type'] = contentTypeOpt
     return headers
   endif
 
@@ -210,8 +212,18 @@ function! s:ParseHeaders(start, end)
     if sepIdx > -1
       let key = s:StrTrim(line[0:sepIdx - 1])
       let headers[key] = s:StrTrim(line[sepIdx + 1:])
+      if key ==? 'Content-Type'
+        let hasContentType = 1
+      endif
     endif
   endfor
+  
+  " Only set default Content-Type if none was found in the request
+  if !hasContentType
+    let contentTypeOpt = s:GetOpt('vrc_header_content_type', 'application/json')
+    let headers['Content-Type'] = contentTypeOpt
+  endif
+  
   return headers
 endfunction
 
@@ -367,7 +379,26 @@ function! s:ParseRequest(start, resumeFrom, end, globSection)
   """ Parse headers if any and merge with global headers.
   let localHeaders = s:ParseHeaders(lineNumHost + 1, lineNumVerb - 1)
   let headers = get(a:globSection, 'headers', {})
-  call extend(headers, localHeaders)
+  if s:GetOpt('vrc_debug', 0)
+    echom '[Debug] Global headers before merge: ' . string(headers)
+    echom '[Debug] Local headers: ' . string(localHeaders)
+  endif
+  " Merge local headers with global headers, but don't override global Content-Type with local defaults
+  for key in keys(localHeaders)
+    " If it's Content-Type and we have a global one, only use local if it's explicitly set
+    if key ==? 'Content-Type' && has_key(headers, 'Content-Type')
+      " Only override if the local Content-Type is not the default
+      let defaultContentType = s:GetOpt('vrc_header_content_type', 'application/json')
+      if localHeaders[key] != defaultContentType
+        let headers[key] = localHeaders[key]
+      endif
+    else
+      let headers[key] = localHeaders[key]
+    endif
+  endfor
+  if s:GetOpt('vrc_debug', 0)
+    echom '[Debug] Final headers after merge: ' . string(headers)
+  endif
 
   """ Parse curl options; local opts overwrite global opts when merged.
   let localCurlOpts = s:ParseCurlOpts(lineNumHost + 1, lineNumVerb - 1)
@@ -560,10 +591,42 @@ function! s:GetCurlDataArgs(request)
       return join(dataLines)
     endif
 
+    """ Auto-detect NDJSON requests by Content-Type header.
+    let contentType = get(a:request.headers, 'Content-Type', '')
+    if s:GetOpt('vrc_debug', 0)
+      echom '[Debug] Content-Type check: ' . contentType
+      echom '[Debug] Request headers: ' . string(a:request.headers)
+    endif
+    if contentType ==? 'application/x-ndjson' || contentType ==? 'application/ndjson'
+      " shellescape also escapes \n (<NL>) to \\n, need to replace back.
+      if s:GetOpt('vrc_debug', 0)
+        echom '[Debug] NDJSON auto-detected via Content-Type: ' . contentType
+        echom '[Debug] Data lines count: ' . len(dataLines)
+        for i in range(len(dataLines))
+          echom '[Debug] Line ' . i . ': ' . dataLines[i]
+        endfor
+      endif
+      return '--data ' .
+           \ substitute(
+             \ s:Shellescape(join(dataLines, "\n") . "\n"),
+             \ '\\\n',
+             \ "\n",
+             \ 'g'
+             \)
+    endif
+
     """ If ElasticSearch support is on and it's a _bulk request.
     let elasticSupport = s:GetOpt('vrc_elasticsearch_support', 0)
     if elasticSupport && match(a:request.requestPath, '/_bulk\|/_msearch') > -1
       " shellescape also escapes \n (<NL>) to \\n, need to replace back.
+      if s:GetOpt('vrc_debug', 0)
+        echom '[Debug] Elasticsearch support: ' . elasticSupport
+        echom '[Debug] Request path: ' . a:request.requestPath
+        echom '[Debug] Data lines count: ' . len(dataLines)
+        for i in range(len(dataLines))
+          echom '[Debug] Line ' . i . ': ' . dataLines[i]
+        endfor
+      endif
       return '--data ' .
            \ substitute(
              \ s:Shellescape(join(dataLines, "\n") . "\n"),
@@ -743,7 +806,12 @@ function! s:RunQuery(start, end)
     silent !clear
     redraw!
 
-    call add(outputInfo['outputChunks'], system(curlCmd))
+    let response = system(curlCmd)
+    if s:GetOpt('vrc_debug', 0)
+      echom '[Debug] Response length: ' . len(response)
+      echom '[Debug] Response preview: ' . response[:100]
+    endif
+    call add(outputInfo['outputChunks'], response)
     if shouldShowCommand
       call add(outputInfo['commands'], curlCmd)
     endif
